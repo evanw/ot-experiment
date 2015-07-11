@@ -170,20 +170,49 @@ Server.prototype.connect = function(client) {
 	this.connections.push({
 		client: client,
 		outgoing: [],
+		sequence: 0,
+		sequenceOffset: 0,
 	});
 };
 
 Server.prototype.receive = function(client) {
-	if (log) console.log(client + ' has ' + client.outgoing.length + ' packets to send to ' + this);
-	while (client.outgoing.length > 0) {
-		var packet = client.outgoing.shift();
-		if (packet.sequence === this.sequence) {
+	for (var i = 0; i < this.connections.length; i++) {
+		var connection = this.connections[i];
+		if (connection.client !== client) {
+			continue;
+		}
+
+		if (log) console.log(client + ' has ' + client.outgoing.length + ' packets to send to ' + this);
+		while (client.outgoing.length > 0) {
+			var packet = client.outgoing.shift();
+			var sequence = packet.sequence;
+
+			// Artificially increment this packet's sequence number if it forms part of
+			// a chain of commands from the client that all don't have conflicts. This
+			// is more efficient than ignoring all except the first command. To avoid
+			// this optimization, just comment out the increment statement.
+			if (connection.sequence === sequence) {
+				sequence += connection.sequenceOffset;
+			}
+
+			if (sequence !== this.sequence) {
+				if (log) console.log(this + ' got ' + dumpCommands([packet.command]) + ' with sequence ' + packet.sequence + ' (adjusted to ' + sequence + ') from ' + client + ', ignored');
+				continue;
+			}
+
 			this.document = apply(this.document, packet.command);
 			this.sequence++;
-			if (log) console.log(this + ' got ' + dumpCommands([packet.command]) + ' with sequence ' + packet.sequence + ' from ' + client + ', used');
+
+			// Advance all subsequent packet sequences so the client can commit a run
+			// of changes without all but the first one being ignored.
+			if (connection.sequence !== packet.sequence) {
+				connection.sequenceOffset = 0;
+			}
+			connection.sequence = packet.sequence;
+			connection.sequenceOffset++;
+
+			if (log) console.log(this + ' got ' + dumpCommands([packet.command]) + ' with sequence ' + packet.sequence + ' (adjusted to ' + sequence + ') from ' + client + ', used');
 			this.broadcast(packet.command);
-		} else {
-			if (log) console.log(this + ' got ' + dumpCommands([packet.command]) + ' with sequence ' + packet.sequence + ' from ' + client + ', ignored');
 		}
 	}
 };
@@ -231,7 +260,7 @@ Client.prototype.apply = function(command) {
 Client.prototype.send = function(command) {
 	if (command.type !== Type.NOP) {
 		this.outgoing.push({
-			sequence: this.sequence, // TODO: Handle multiple packets in flight simultaneously, right now extra ones are ignored
+			sequence: this.sequence,
 			command: command,
 		});
 		if (log) console.log(this + ' sent ' + dumpCommands([command]));
