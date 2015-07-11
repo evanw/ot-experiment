@@ -1,4 +1,5 @@
-var log = false;
+// Turn on logging for debugging (slows stuff down by 50x)
+var log = true;
 
 var Type = {
 	NOP: 0,
@@ -6,18 +7,22 @@ var Type = {
 	INS: 2
 };
 
+// Null command (emitted when two commands cancel out)
 function nop() {
 	return {type: Type.NOP};
 }
 
+// Deletion command
 function del(index) {
 	return {type: Type.DEL, index: index};
 }
 
+// Insertion command
 function ins(index, data) {
 	return {type: Type.INS, index: index, data: data};
 }
 
+// Documents are arrays of strings
 function apply(document, command) {
 	switch (command.type) {
 		case Type.NOP: {
@@ -38,6 +43,7 @@ function apply(document, command) {
 			return document.slice(0, command.index).concat(command.data, document.slice(command.index));
 		}
 	}
+
 	throw new Error('pattern matching failed');
 }
 
@@ -104,6 +110,174 @@ function xform(a, b) {
 	throw new Error('pattern matching failed');
 }
 
+////////////////////////////////////////////////////////////////////////////////
+// This simulates a simple server and assumes all clients start off with the
+// same document. This means it doesn't handle connections coming and going.
+
+function Server(document) {
+	this.document = document;
+	this.connections = [];
+	this.sequence = 0;
+}
+
+Server.prototype.connect = function(client) {
+	this.connections.push({
+		client: client,
+		outgoing: [],
+		sequence: 0,
+		sequenceOffset: 0,
+	});
+};
+
+Server.prototype.receive = function(client) {
+	for (var i = 0; i < this.connections.length; i++) {
+		var connection = this.connections[i];
+		if (connection.client !== client) {
+			continue;
+		}
+
+		if (log) console.log(client + ' has ' + client.outgoing.length + ' packets to send to ' + this);
+		while (client.outgoing.length > 0) {
+			var packet = client.outgoing.shift();
+			var sequence = packet.sequence;
+
+			// Artificially increment this packet's sequence number if it forms part of
+			// a chain of commands from the client that all don't have conflicts. This
+			// is more efficient than ignoring all except the first command. To avoid
+			// this optimization, just comment out the increment statement.
+			if (connection.sequence === sequence) {
+				sequence += connection.sequenceOffset;
+			}
+
+			if (sequence !== this.sequence) {
+				if (log) console.log(this + ' got ' + dumpCommands([packet.command]) + ' with sequence ' + packet.sequence + ' (adjusted to ' + sequence + ') from ' + client + ', ignored');
+				continue;
+			}
+
+			// This document is only used for debugging, and can be removed completely.
+			this.document = apply(this.document, packet.command);
+
+			// Increase the sequence number so we ignore out-of-date commands.
+			this.sequence++;
+
+			// Advance all subsequent packet sequences so the client can commit a run
+			// of changes without all but the first one being ignored.
+			if (connection.sequence !== packet.sequence) {
+				connection.sequenceOffset = 0;
+			}
+			connection.sequence = packet.sequence;
+			connection.sequenceOffset++;
+
+			if (log) console.log(this + ' got ' + dumpCommands([packet.command]) + ' with sequence ' + packet.sequence + ' (adjusted to ' + sequence + ') from ' + client + ', used');
+			this.broadcast(packet.command);
+		}
+	}
+};
+
+Server.prototype.broadcast = function(command) {
+	this.connections.forEach(function(connection) {
+		connection.outgoing.push(command);
+	});
+};
+
+Server.prototype.send = function(client) {
+	this.connections.forEach(function(connection) {
+		if (connection.client === client) {
+			if (log) console.log(this + ' has ' + connection.outgoing.length + ' packets to send to ' + client);
+			while (connection.outgoing.length > 0) {
+				client.receive(connection.outgoing.shift());
+			}
+		}
+	}, this);
+};
+
+Server.prototype.toString = function() {
+	return '[server, document ' + dumpDocument(this.document) + ', sequence ' + this.sequence + ']';
+};
+
+////////////////////////////////////////////////////////////////////////////////
+// This simulates a simple client and assumes the server starts off with the
+// same document. Clients will have to send the same command multiple times if
+// that command is rejected by the server.
+
+function Client(name, document, server) {
+	this.name = name;
+	this.document = document;
+	this.server = server;
+	this.local = [];
+	this.outgoing = [];
+	this.sequence = 0;
+	server.connect(this);
+}
+
+Client.prototype.apply = function(command) {
+	this.document = apply(this.document, command);
+	if (log) console.log(this + ' applied ' + dumpCommands([command]));
+	this.local.push(command);
+	this.send(command);
+};
+
+Client.prototype.send = function(command) {
+	if (command.type !== Type.NOP) {
+		this.outgoing.push({
+			sequence: this.sequence,
+			command: command,
+		});
+		if (log) console.log(this + ' sent ' + dumpCommands([command]));
+	}
+};
+
+Client.prototype.receive = function(command) {
+	this.sequence++;
+	if (log) console.log(this + ' got ' + dumpCommands([command]));
+
+	for (var i = 0; i < this.local.length; i++) {
+		var local = this.local[i];
+
+		// Null commands apparently need to be special-cased or local commands get
+		// turned into null commands during the operational transformation.
+		if (command.type === Type.NOP) {
+			this.send(local);
+			continue;
+		}
+
+		// I got hung up on this part for a while. Requiring the local commands to
+		// be transformed along with the remote commands was counter-intuitive.
+		var both = xform(local, command);
+		if (log) console.log(this + ' ran xform on ' + dumpCommands([local, command]) + ', got ' + dumpCommands(both));
+		local = both[0];
+		command = both[1];
+
+		// Local commands are "acknowledged" by the server as an inherent property
+		// of the transformation. Identical commands always cancel out completely.
+		if (local.type === Type.NOP) {
+			this.local.splice(i--, 1);
+		}
+
+		// Send rejected changes back up to the server to try again. It would be
+		// wise to delay sending these commands until the client is done receiving
+		// a batch of commands from the server, but commands are just sent up to
+		// the server repeatedly for now.
+		else {
+			this.local[i] = local;
+			this.send(local);
+		}
+	}
+
+	this.document = apply(this.document, command);
+	if (log) console.log(this + ' applied ' + dumpCommands([command]));
+};
+
+Client.prototype.toString = function() {
+	return '[client ' + this.name + ', document ' + dumpDocument(this.document) + ', sequence ' + this.sequence + ']';
+};
+
+////////////////////////////////////////////////////////////////////////////////
+// This is some testing code to try to ensure that everything works. Instead of
+// randomly fuzzing the input and checking for errors, this code attempts to
+// generate all possible interactions of a certain type. Hopefully I got the
+// case generation correct.
+
 function permutations(values) {
 	if (values.length < 2) {
 		return [values];
@@ -157,149 +331,6 @@ function check(expected, actual) {
 		throw new Error('mismatch');
 	}
 }
-
-////////////////////////////////////////////////////////////////////////////////
-
-function Server(document) {
-	this.document = document;
-	this.connections = [];
-	this.sequence = 0;
-}
-
-Server.prototype.connect = function(client) {
-	this.connections.push({
-		client: client,
-		outgoing: [],
-		sequence: 0,
-		sequenceOffset: 0,
-	});
-};
-
-Server.prototype.receive = function(client) {
-	for (var i = 0; i < this.connections.length; i++) {
-		var connection = this.connections[i];
-		if (connection.client !== client) {
-			continue;
-		}
-
-		if (log) console.log(client + ' has ' + client.outgoing.length + ' packets to send to ' + this);
-		while (client.outgoing.length > 0) {
-			var packet = client.outgoing.shift();
-			var sequence = packet.sequence;
-
-			// Artificially increment this packet's sequence number if it forms part of
-			// a chain of commands from the client that all don't have conflicts. This
-			// is more efficient than ignoring all except the first command. To avoid
-			// this optimization, just comment out the increment statement.
-			if (connection.sequence === sequence) {
-				sequence += connection.sequenceOffset;
-			}
-
-			if (sequence !== this.sequence) {
-				if (log) console.log(this + ' got ' + dumpCommands([packet.command]) + ' with sequence ' + packet.sequence + ' (adjusted to ' + sequence + ') from ' + client + ', ignored');
-				continue;
-			}
-
-			this.document = apply(this.document, packet.command);
-			this.sequence++;
-
-			// Advance all subsequent packet sequences so the client can commit a run
-			// of changes without all but the first one being ignored.
-			if (connection.sequence !== packet.sequence) {
-				connection.sequenceOffset = 0;
-			}
-			connection.sequence = packet.sequence;
-			connection.sequenceOffset++;
-
-			if (log) console.log(this + ' got ' + dumpCommands([packet.command]) + ' with sequence ' + packet.sequence + ' (adjusted to ' + sequence + ') from ' + client + ', used');
-			this.broadcast(packet.command);
-		}
-	}
-};
-
-Server.prototype.broadcast = function(command) {
-	this.connections.forEach(function(connection) {
-		connection.outgoing.push(command);
-	});
-};
-
-Server.prototype.send = function(client) {
-	this.connections.forEach(function(connection) {
-		if (connection.client === client) {
-			if (log) console.log(this + ' has ' + connection.outgoing.length + ' packets to send to ' + client);
-			while (connection.outgoing.length > 0) {
-				client.receive(connection.outgoing.shift());
-			}
-		}
-	}, this);
-};
-
-Server.prototype.toString = function() {
-	return '[server, document ' + dumpDocument(this.document) + ', sequence ' + this.sequence + ']';
-};
-
-////////////////////////////////////////////////////////////////////////////////
-
-function Client(name, document, server) {
-	this.name = name;
-	this.document = document;
-	this.server = server;
-	this.local = [];
-	this.outgoing = [];
-	this.sequence = 0;
-	server.connect(this);
-}
-
-Client.prototype.apply = function(command) {
-	this.document = apply(this.document, command);
-	if (log) console.log(this + ' applied ' + dumpCommands([command]));
-	this.local.push(command);
-	this.send(command);
-};
-
-Client.prototype.send = function(command) {
-	if (command.type !== Type.NOP) {
-		this.outgoing.push({
-			sequence: this.sequence,
-			command: command,
-		});
-		if (log) console.log(this + ' sent ' + dumpCommands([command]));
-	}
-};
-
-Client.prototype.receive = function(command) {
-	this.sequence++;
-	if (log) console.log(this + ' got ' + dumpCommands([command]));
-
-	for (var i = 0; i < this.local.length; i++) {
-		var local = this.local[i];
-		if (command.type === Type.NOP) {
-			this.send(local);
-			continue;
-		}
-
-		var both = xform(local, command);
-		if (log) console.log(this + ' ran xform on ' + dumpCommands([local, command]) + ', got ' + dumpCommands(both));
-		local = both[0];
-		command = both[1];
-
-		if (local.type === Type.NOP) {
-			this.local.splice(i--, 1);
-		} else {
-			this.local[i] = local;
-			this.send(local);
-		}
-	}
-
-	this.document = apply(this.document, command);
-	if (log) console.log(this + ' applied ' + dumpCommands([command]));
-};
-
-Client.prototype.toString = function() {
-	return '[client ' + this.name + ', document ' + dumpDocument(this.document) + ', sequence ' + this.sequence + ']';
-};
-
-////////////////////////////////////////////////////////////////////////////////
 
 function bruteForce() {
 	var document = ['1', '2', '3'];
