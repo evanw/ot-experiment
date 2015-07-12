@@ -1,5 +1,5 @@
 // Turn on logging for debugging (slows stuff down by 50x)
-var log = true;
+var log = false;
 
 var Type = {
 	NOP: 0,
@@ -302,12 +302,43 @@ function mixedPermutations(prefix, a, b) {
 		mixedPermutations(prefix.concat(b[0]), a, b.slice(1)));
 }
 
-function insertOrDelete(length, index, value) {
-	if (index < length) {
-		return del(index);
-	} else {
-		return ins(index - length, value);
+function allPossibleCommandSequencesOfLength(document, length, base) {
+	if (length === 0) {
+		return [];
 	}
+
+	// Find all possible single commands for this document
+	var commands = [];
+	for (var i = 0; i <= document.length; i++) {
+		commands.push(ins(i, base));
+	}
+	for (var i = 0; i < document.length; i++) {
+		commands.push(del(i));
+	}
+
+	// Use each command as the start of a sequence recursively
+	var sequences = [];
+	commands.forEach(function(command) {
+		if (length === 1) {
+			sequences.push([command]);
+		} else {
+			var nested = allPossibleCommandSequencesOfLength(apply(document, command), length - 1, String.fromCharCode(base.charCodeAt(0) + 1));
+			nested.forEach(function(sequence) {
+				sequence.unshift(command);
+			});
+			sequences.push.apply(sequences, nested);
+		}
+	});
+
+	return sequences;
+}
+
+function allPossibleCommandSequencesOfLengthUpTo(document, length, base) {
+	var sequences = [];
+	for (var i = 0; i < length; i++) {
+		sequences.push.apply(sequences, allPossibleCommandSequencesOfLength(document, i + 1, base));
+	}
+	return sequences;
 }
 
 function dumpDocument(document) {
@@ -335,122 +366,34 @@ function check(expected, actual) {
 function bruteForce() {
 	var document = ['1', '2', '3'];
 
-	console.log('simulate two different clients making an edit at once');
-	for (var a = 0; a <= 2 * document.length; a++) {
-		var A = insertOrDelete(document.length, a, 'A');
-		for (var b = 0; b <= 2 * document.length; b++) {
-			var B = insertOrDelete(document.length, b, 'B');
-			permutations([A, B]).forEach(function(order) {
-				var X = order[0];
-				var Y = order[1];
-
+	console.log('all possible sequences of length up to 2');
+	allPossibleCommandSequencesOfLengthUpTo(document, 2, 'A').forEach(function(commands0) {
+		allPossibleCommandSequencesOfLengthUpTo(document, 2, 'X').forEach(function(commands1) {
+			mixedPermutations([], commands0, commands1).forEach(function(order) {
 				var server = new Server(document);
-				var clientX = new Client('X', document, server);
-				var clientY = new Client('Y', document, server);
+				var client0 = new Client('0', document, server);
+				var client1 = new Client('1', document, server);
 
-				if (log) console.log('commands are ' + dumpCommands([X, Y]) + ', document is ' + dumpDocument(document));
-				clientX.apply(X);
-				clientY.apply(Y);
+				if (log) console.log('commands are ' + dumpCommands(commands0) + ' and ' + dumpCommands(commands1) + ', document is ' + dumpDocument(document));
+				order.forEach(function(command) {
+					var client = commands0.indexOf(command) >= 0 ? client0 : client1;
+					client.apply(command);
+					server.receive(client);
+				});
 
-				for (var i = 0; i < 2; i++) {
-					server.receive(clientX);
-					server.receive(clientY);
-
-					server.send(clientX);
-					server.send(clientY);
+				for (var i = 0; i < commands0.length + commands1.length; i++) {
+					server.receive(client0);
+					server.receive(client1);
+					server.send(client0);
+					server.send(client1);
 				}
 
-				check(server.document, clientX.document);
-				check(server.document, clientY.document);
+				check(server.document, client0.document);
+				check(server.document, client1.document);
 				if (log) console.log();
 			});
-		}
-	}
-
-	console.log('simulate three different clients all making an edit at once');
-	for (var a = 0; a <= 2 * document.length; a++) {
-		var A = insertOrDelete(document.length, a, 'A');
-		for (var b = 0; b <= 2 * document.length; b++) {
-			var B = insertOrDelete(document.length, b, 'B');
-			for (var c = 0; c <= 2 * document.length; c++) {
-				var C = insertOrDelete(document.length, c, 'C');
-				permutations([A, B, C]).forEach(function(order) {
-					var X = order[0];
-					var Y = order[1];
-					var Z = order[2];
-
-					var server = new Server(document);
-					var clientX = new Client('X', document, server);
-					var clientY = new Client('Y', document, server);
-					var clientZ = new Client('Z', document, server);
-
-					if (log) console.log('commands are ' + dumpCommands([X, Y, Z]) + ', document is ' + dumpDocument(document));
-					clientX.apply(X);
-					clientY.apply(Y);
-					clientZ.apply(Z);
-
-					for (var i = 0; i < 3; i++) {
-						server.receive(clientX);
-						server.receive(clientY);
-						server.receive(clientZ);
-
-						server.send(clientX);
-						server.send(clientY);
-						server.send(clientZ);
-					}
-
-					check(server.document, clientX.document);
-					check(server.document, clientY.document);
-					check(server.document, clientZ.document);
-					if (log) console.log();
-				});
-			}
-		}
-	}
-
-	console.log('simulate two different clients making two edits at once');
-	for (var a0 = 0; a0 <= 2 * document.length; a0++) {
-		var A0 = insertOrDelete(document.length, a0, 'A');
-		var limitA = apply(document, A0).length;
-
-		for (var a1 = 0; a1 <= 2 * limitA; a1++) {
-			var A1 = insertOrDelete(limitA, a1, 'a');
-
-			for (var b0 = 0; b0 <= 2 * document.length; b0++) {
-				var B0 = insertOrDelete(document.length, b0, 'B');
-				var limitB = apply(document, B0).length;
-
-				for (var b1 = 0; b1 <= 2 * limitB; b1++) {
-					var B1 = insertOrDelete(limitB, b1, 'b');
-
-					mixedPermutations([], [A0, A1], [B0, B1]).forEach(function(order) {
-						var server = new Server(document);
-						var clientX = new Client('X', document, server);
-						var clientY = new Client('Y', document, server);
-
-						if (log) console.log('commands are ' + dumpCommands([A0, A1]) + ' and ' + dumpCommands([B0, B1]) + ', document is ' + dumpDocument(document));
-						order.forEach(function(command) {
-							if (command === A0) clientX.apply(A0);
-							if (command === A1) clientX.apply(A1);
-							if (command === B0) clientY.apply(B0);
-							if (command === B1) clientY.apply(B1);
-						});
-
-						for (var i = 0; i < 4; i++) {
-							server.receive(clientX);
-							server.receive(clientY);
-							server.send(clientX);
-							server.send(clientY);
-						}
-
-						check(server.document, clientX.document);
-						check(server.document, clientY.document);
-						if (log) console.log();
-					});
-				}
-			}
-		}
-	}
+		});
+	});
 
 	console.log('all tests passed');
 }
